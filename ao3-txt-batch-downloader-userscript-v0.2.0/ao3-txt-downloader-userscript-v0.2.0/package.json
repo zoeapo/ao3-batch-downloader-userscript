@@ -1,0 +1,8 @@
+{
+  "name": "ao3-txt-batch-downloader-userscript",
+  "version": "0.2.0",
+  "private": true,
+  "scripts": {
+    "check": "node --check ao3-txt-batch-downloader.user.js"
+  }
+}
