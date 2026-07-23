@@ -1,10 +1,14 @@
 {
   "name": "ao3-batch-downloader-userscript",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
-  "type": "module",
+  "description": "Import AO3 work URLs from TXT and batch-download official EPUB and PDF files.",
+  "license": "GPL-3.0-only",
   "scripts": {
-    "check": "node --check ao3-batch-downloader.user.js && node tests/static-check.mjs"
+    "check": "node scripts/check.mjs",
+    "syntax": "node --check ao3-txt-batch-downloader.user.js"
   },
-  "license": "GPL-3.0-only"
+  "engines": {
+    "node": ">=18"
+  }
 }

@@ -1,208 +1,199 @@
-# AO3 批量作品下载器
+# AO3 TXT 批量作品下载器
 
-这是一个用于 Chrome + Tampermonkey 的 AO3 油猴脚本。它会扫描当前 AO3 作品列表的全部分页，收集作品链接，按条件筛选，然后从每部作品页提取 AO3 官方 EPUB 和 PDF 下载链接。
+这是一个适用于 Chrome 和 Tampermonkey 的油猴脚本。
 
-脚本下载的是 AO3 生成的作品文件，不会把标签页、搜索页、书签页、作者页面或系列页面保存成网页文件。AO3 官方下载文件包含下载时已经发布的全部章节。
+它从本地 TXT 文件读取 AO3 作品网址，自动清洗链接、去重，并批量下载 AO3 官方提供的 EPUB 和 PDF。
 
-当前版本：`0.1.0`
+## 当前版本
 
-## 已实现功能
+v0.3.0
 
-- 扫描当前列表的全部分页
-- 支持标签页、搜索结果、作者作品、书签、系列、订阅列表和单篇作品页
-- 将章节链接和带参数链接统一为标准作品链接
-- 批量下载 AO3 官方 EPUB 和 PDF
-- 沿用 AO3 下载链接中的官方文件名
-- 导出全部作品链接或筛选后作品链接为 TXT
-- 按“作品编号 + 文件格式”记录下载结果
-- 已成功下载的 EPUB 和 PDF 分别去重
-- EPUB 成功、PDF 失败时，下次只重试 PDF
-- 设置分页扫描、作品之间、两种格式之间的请求间隔
-- 识别 AO3 的 429 请求限制，并根据 `Retry-After` 暂停
-- 暂停、继续和停止下载任务
-- 中文操作面板
+## 主要功能
+
+- 导入包含大量 AO3 作品网址的 TXT 文件
+- 支持章节链接、带参数链接和带锚点链接
+- 自动统一为 `https://archiveofourown.org/works/作品编号`
+- 自动去重
+- 分别下载 EPUB 和 PDF
+- 保留 AO3 官方下载文件名
+- 可选择本地保存文件夹
+- 同名文件自动加 `(1)`、`(2)` 等编号
+- 作品间隔、格式间隔、失败重试间隔均可设置为随机范围
+- 下载记录和按格式去重
+- 页面刷新后恢复上次导入队列
+- 暂停、继续和停止任务
+- 导出清洗后的链接、失败链接、无效行和完整记录
+- 遇到 AO3 HTTP 429 时遵守服务器给出的等待时间
+- 使用当前浏览器中的 AO3 登录状态
 
 ## 安装
 
-### 1. 安装 Tampermonkey
+1. 在 Chrome 中安装 Tampermonkey。
+2. 打开 `ao3-txt-batch-downloader.user.js`。
+3. Tampermonkey 出现安装页面后点击安装。
+4. 打开任意 AO3 页面。
+5. 页面右下角会出现“TXT 批量下载”按钮。
 
-在 Chrome 中安装 Tampermonkey。
+仓库上传完成后，也可以通过以下地址安装：
 
-较新的 Chrome 和 Tampermonkey 版本可能要求开启扩展程序的开发者模式或额外用户脚本权限。按 Tampermonkey 页面中的提示操作即可。
-
-### 2. 开启 Tampermonkey 下载权限
-
-打开 Tampermonkey 管理面板的“设置”，找到“下载”部分：
-
-1. 将下载模式设为 `Browser API`。
-2. 确认允许的文件扩展名包含：
-   - `epub`
-   - `pdf`
-   - `txt`
-   - `json`
-3. Chrome 弹出下载权限请求时选择允许。
-
-Tampermonkey 官方说明：
-
-- https://www.tampermonkey.net/faq.php?q=Q302
-- https://www.tampermonkey.net/documentation.php?q=GM_download
-
-### 3. 安装脚本
-
-打开 `ao3-batch-downloader.user.js`，复制全部内容，在 Tampermonkey 中新建脚本并保存。
-
-也可以直接把 `.user.js` 文件拖入浏览器，由 Tampermonkey 接管安装。
+```text
+https://raw.githubusercontent.com/zoeapo/ao3-batch-downloader-userscript/main/ao3-txt-batch-downloader.user.js
+```
 
 ## 使用方法
 
-1. 先在 AO3 使用网站自带的 Sort and Filter 设置主要条件。
-2. 打开筛选后的第一页、任意分页或单篇作品页。
-3. 点击页面右下角的“AO3 批量下载”。
-4. 选择 EPUB、PDF 或两者。
-5. 设置脚本追加筛选条件。
-6. 点击“扫描全部分页”。
-7. 检查“发现”和“筛选后”的数量。
-8. 可以先导出 TXT，确认作品范围。
-9. 点击“开始下载”。
+1. 打开任意 AO3 页面。
+2. 点击右下角“TXT 批量下载”。
+3. 点击“选择 TXT”，导入网址文件。
+4. 检查识别数量、重复数量和无法识别数量。
+5. 选择 EPUB、PDF 或两者。
+6. 按需设置随机间隔。
+7. 需要指定保存位置时，点击“选择保存文件夹”。
+8. 勾选“保存到所选文件夹”。
+9. 点击“开始”。
 
-脚本会删除当前网址中的 `page` 参数，从第一页开始扫描，再沿 AO3 的下一页链接继续，直到没有下一页。
+## 选择保存文件夹
 
-首次连续下载多个文件时，Chrome 可能询问是否允许 AO3 或 Tampermonkey 下载多个文件，需要选择允许。
+v0.3.0 增加了文件夹选择功能。
 
-## 筛选规则
+点击“选择保存文件夹”后，Chrome 会显示文件夹选择窗口。授权后，EPUB 和 PDF 会直接写入该文件夹，不再使用浏览器默认下载目录。
 
-建议先使用 AO3 自带筛选器完成大部分筛选，脚本用于追加条件和下载前复核。
+脚本会把文件夹句柄保存在浏览器的 IndexedDB 中。刷新页面后可能需要重新授权。点击“重新授权或更换文件夹”即可。
 
-### 基础筛选
+如果取消勾选“保存到所选文件夹”，脚本会继续使用普通浏览器下载方式。
 
-- 完结状态：全部、仅完结、仅未完结
-- 最低字数
-- 最高字数
-- 分级：General、Teen、Mature、Explicit、Not Rated
-- 分类：F/F、F/M、Gen、M/M、Multi、Other
+文件夹模式目前以 Chrome 为主要支持环境。其他浏览器可能无法使用目录选择功能，但普通下载仍可使用。
 
-分级和分类不勾选时表示不限制。
-
-### 标签筛选
-
-可以填写：
-
-- 语言
-- Fandom
-- Relationship
-- Character
-- Additional Tag
-- 排除 Warning
-- 排除 Relationship
-- 排除 Character
-- 排除 Additional Tag
-
-每行填写一个条件。逗号属于标签文字的一部分，不会被脚本当成分隔符。
-
-“完整标签相同”会忽略英文字母大小写，但要求标签全文相同。
-
-“标签中包含文字”适合只记得标签片段的情况。例如填写 `Slow Burn` 可以匹配包含这段文字的标签。
-
-每个已经填写的筛选字段都必须通过。在同一个字段里：
-
-- “命中任意一项”：该字段中的任意一行匹配即可。
-- “必须全部命中”：该字段中的每一行都必须找到匹配项。
-
-排除条件只要命中任意一行，作品就会被排除。
-
-### 语言筛选的额外请求
-
-AO3 普通作品列表通常不显示语言。使用语言筛选时，脚本需要额外读取每一部作品页，再进行筛选。因此扫描时间和请求数量会明显增加。
-
-订阅列表等只有作品链接、没有完整作品摘要的页面，在启用字数、分级、标签等筛选时，也会额外读取作品页补全信息。
-
-## 下载记录和去重
-
-记录保存在 Tampermonkey 脚本存储中，不会扫描电脑文件夹。
-
-记录单位为：
-
-```text
-作品编号 + EPUB
-作品编号 + PDF
-```
-
-所以两种格式互不影响。开启“跳过已有成功记录”后：
-
-- 两种格式都成功时，两种都跳过。
-- EPUB 成功、PDF 失败时，只重试 PDF。
-- 失败记录不会被当作已下载成功。
-
-可以导出 JSON 备份记录，也可以清空记录。清空记录不会删除电脑中的文件。
-
-## 文件名
-
-脚本从 AO3 官方下载链接中读取文件名，不使用“作者 - 标题”等自定义格式。
-
-AO3 可能自行缩短过长标题、去掉部分字符或转写非拉丁字母，这属于 AO3 官方文件名生成规则：
-
-https://archiveofourown.org/faq/downloading-fanworks
-
-## 登录作品和成人内容
-
-脚本使用当前浏览器中的 AO3 登录状态。需要登录的作品只有在当前浏览器已经登录并有权访问时才能下载。
-
-脚本会给作品页添加 `view_adult=true`，尽量直接通过成人内容确认页。如果仍然遇到 Proceed 页面，也会尝试读取 Proceed 链接。
-
-不要把 AO3 密码输入脚本。脚本没有账号密码输入框，也不会保存密码。
-
-## 请求间隔建议
+## 随机间隔
 
 默认值：
 
-- 分页和筛选信息请求：2 秒
-- 作品之间：3 秒
-- 同一作品两种格式之间：1 秒
+- 作品间隔：10 至 15 秒
+- 格式间隔：1 至 3 秒
+- 失败重试间隔：5 至 15 秒
+- 失败重试次数：2 次
 
-不建议全部设为 0。大量、连续请求更容易触发 AO3 的访问限制。
+每次等待都会重新随机取一个整数。例如作品间隔设为 10 至 15 秒，实际可能依次等待 13、10、15、12 秒。
 
-遇到 HTTP 429 时，脚本会读取服务器返回的 `Retry-After`，暂停后再继续。暂停期间，浏览器直接访问 AO3 也可能显示稍后重试。
+随机间隔不能保证不会触发 AO3 限流。出现 HTTP 429 时，脚本会按 AO3 返回的 `Retry-After` 时间暂停。
 
-## 已知限制
+## TXT 支持格式
 
-- 不能扫描电脑文件夹中的 EPUB 或 PDF。
-- 不能自动识别本地未完结作品并更新。
-- 不能在 EPUB、PDF、MOBI、AZW3 之间转换格式。
-- 浏览器关闭、页面刷新或标签页关闭会中断当前队列。
-- 下载记录只表示 Tampermonkey 回调报告下载成功，不能确认文件后来是否被手动删除。
-- AO3 页面结构调整后，部分选择器可能需要更新。
-- AO3 官方说明中提到，超长作品或包含大量图片的作品仍可能下载失败。
+以下链接都会被识别：
 
-## 与 ao3downloader 的关系
+```text
+https://archiveofourown.org/works/87836186
+https://archiveofourown.org/works/87836186/chapters/123456
+https://archiveofourown.org/works/87836186/chapters/123456#workskin
+https://archiveofourown.org/works/87836186#main
+https://archiveofourown.org/works/87836186?view_full_work=true#main
+https://archiveofourown.org/works/87836186?__cf_chl_f_tk=xxxx
+```
 
-本脚本是浏览器端独立重写，功能设计参考：
+统一结果：
 
-https://github.com/nianeyna/ao3downloader
+```text
+https://archiveofourown.org/works/87836186
+```
 
-原项目是 Python 命令行程序，包含本地文件扫描、更新、格式处理和日志等能力。本脚本只实现适合浏览器环境的部分。
+每行可以有一个链接，也可以包含其他文字。脚本会提取其中的作品编号。
 
-本项目与 AO3、OTW 以及原 ao3downloader 作者没有隶属关系。
+## 下载记录
 
-## 开发检查
+记录单位为“作品编号 + 文件格式”。
 
-需要 Node.js 18 或更高版本：
+例如 EPUB 下载成功、PDF 下载失败，下次运行时可以跳过 EPUB，只重试 PDF。
+
+点击“清空下载记录”后，脚本会重新下载曾经成功的文件。
+
+## 文件名冲突
+
+使用所选文件夹时，脚本不会覆盖现有文件。
+
+例如文件夹里已有：
+
+```text
+example.epub
+```
+
+新文件会保存为：
+
+```text
+example (1).epub
+```
+
+## EPUB 下载问题
+
+普通下载模式下，如果 Tampermonkey 返回 `not_whitelisted`，脚本会改用二进制读取和浏览器下载。
+
+文件夹模式直接读取文件并写入所选目录，不受 Tampermonkey 扩展名白名单限制。
+
+## 更新
+
+安装脚本后，Tampermonkey 会根据脚本头部的 `@updateURL` 检查更新。
+
+发布新版本时需要同时更新：
+
+- `ao3-txt-batch-downloader.user.js`
+- `dist/ao3-txt-batch-downloader-v版本号.user.js`
+- 脚本头部 `@version`
+- `CHANGELOG.md`
+- `package.json`
+
+## 项目结构
+
+```text
+ao3-batch-downloader-userscript/
+├─ ao3-txt-batch-downloader.user.js
+├─ dist/
+│  └─ ao3-txt-batch-downloader-v0.3.0.user.js
+├─ docs/
+│  ├─ ARCHITECTURE.md
+│  ├─ PRIVACY.md
+│  └─ TESTING.md
+├─ scripts/
+│  └─ check.mjs
+├─ .github/
+│  ├─ ISSUE_TEMPLATE/
+│  └─ pull_request_template.md
+├─ CHANGELOG.md
+├─ CONTRIBUTING.md
+├─ LICENSE
+├─ NOTICE.md
+├─ package.json
+└─ README.md
+```
+
+## 本地检查
+
+需要 Node.js。
 
 ```bash
 npm run check
 ```
 
-检查内容：
+检查内容包括：
 
-- userscript JavaScript 语法
-- 必要的 userscript 元数据
-- 链接标准化
-- 字数与章节解析
-- 分级和分类标准化
-- 筛选逻辑
-- AO3 官方文件名提取
+- JavaScript 语法
+- userscript 元数据
+- 版本号一致性
+- GitHub 更新地址
+- 关键功能函数是否存在
 
-详细人工测试步骤见 `TESTING.md`。
+## 隐私
+
+脚本只把请求发送给 AO3 相关域名。TXT 文件、下载记录和文件夹句柄保存在本地浏览器中。
+
+详细说明见 `docs/PRIVACY.md`。
 
 ## 许可证
 
-GPL-3.0-only。完整文本见 `LICENSE`。
+GPL-3.0-only。
+
+## 致谢
+
+功能设计参考了：
+
+- `nianeyna/ao3downloader`
+
+本项目是浏览器端独立重写，与 Archive of Our Own、OTW 和原项目作者没有隶属关系。

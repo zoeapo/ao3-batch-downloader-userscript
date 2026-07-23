@@ -1,10 +1,14 @@
 // ==UserScript==
 // @name         AO3 TXT 批量作品下载器
 // @namespace    https://github.com/zoeapo/ao3-batch-downloader-userscript
-// @version      0.2.0
-// @description  导入包含 AO3 作品网址的 TXT 文件，自动清洗、去重，并批量下载官方 EPUB 和 PDF。
+// @version      0.3.0
+// @description  导入包含 AO3 作品网址的 TXT 文件，自动清洗、去重，并以随机间隔批量下载官方 EPUB 和 PDF；Chrome 可选择本地保存文件夹。
 // @author       zoeapo
 // @license      GPL-3.0-only
+// @homepageURL  https://github.com/zoeapo/ao3-batch-downloader-userscript
+// @supportURL   https://github.com/zoeapo/ao3-batch-downloader-userscript/issues
+// @downloadURL  https://raw.githubusercontent.com/zoeapo/ao3-batch-downloader-userscript/main/ao3-txt-batch-downloader.user.js
+// @updateURL    https://raw.githubusercontent.com/zoeapo/ao3-batch-downloader-userscript/main/ao3-txt-batch-downloader.user.js
 // @match        https://archiveofourown.org/*
 // @match        https://www.archiveofourown.org/*
 // @match        https://archiveofourown.com/*
@@ -44,8 +48,11 @@
   'use strict';
 
   const APP_NAME = 'AO3 TXT 批量作品下载器';
-  const APP_VERSION = '0.2.0';
+  const APP_VERSION = '0.3.0';
   const CANONICAL_ORIGIN = 'https://archiveofourown.org';
+  const DIRECTORY_DB_NAME = 'ao3txt.filesystem.v1';
+  const DIRECTORY_STORE_NAME = 'handles';
+  const DIRECTORY_HANDLE_KEY = 'download-directory';
   const STORAGE_SETTINGS = 'ao3txt.settings.v2';
   const STORAGE_RECORDS = 'ao3txt.records.v2';
   const STORAGE_QUEUE = 'ao3txt.queue.v2';
@@ -54,10 +61,15 @@
   const DEFAULT_SETTINGS = Object.freeze({
     formats: ['EPUB', 'PDF'],
     skipDownloaded: true,
-    workDelaySeconds: 3,
-    formatDelaySeconds: 1,
+    workDelayMinSeconds: 10,
+    workDelayMaxSeconds: 15,
+    formatDelayMinSeconds: 1,
+    formatDelayMaxSeconds: 3,
+    retryDelayMinSeconds: 5,
+    retryDelayMaxSeconds: 15,
     maxRetries: 2,
     requestTimeoutSeconds: 60,
+    useSelectedDirectory: false,
   });
 
   const RETRY_STATUS = new Set([500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530]);
@@ -73,6 +85,8 @@
     stopped: false,
     currentIndex: 0,
     activeDownloads: new Set(),
+    directoryHandle: null,
+    directoryPermission: 'none',
     stats: { success: 0, failed: 0, skipped: 0 },
   };
 
@@ -106,6 +120,264 @@
 
   function saveRecords(records) {
     saveJson(STORAGE_RECORDS, records);
+  }
+
+  function supportsDirectoryPicker() {
+    return typeof window.showDirectoryPicker === 'function';
+  }
+
+  function openDirectoryDatabase() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) {
+        reject(new Error('当前浏览器无法保存文件夹授权信息'));
+        return;
+      }
+      const request = window.indexedDB.open(DIRECTORY_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains(DIRECTORY_STORE_NAME)) {
+          database.createObjectStore(DIRECTORY_STORE_NAME);
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('无法打开文件夹授权数据库'));
+    });
+  }
+
+  async function readStoredDirectoryHandle() {
+    const database = await openDirectoryDatabase();
+    try {
+      return await new Promise((resolve, reject) => {
+        const transaction = database.transaction(DIRECTORY_STORE_NAME, 'readonly');
+        const request = transaction.objectStore(DIRECTORY_STORE_NAME).get(DIRECTORY_HANDLE_KEY);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error || new Error('无法读取已保存的文件夹'));
+      });
+    } finally {
+      database.close();
+    }
+  }
+
+  async function storeDirectoryHandle(handle) {
+    const database = await openDirectoryDatabase();
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction(DIRECTORY_STORE_NAME, 'readwrite');
+        transaction.objectStore(DIRECTORY_STORE_NAME).put(handle, DIRECTORY_HANDLE_KEY);
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error || new Error('无法保存文件夹授权'));
+        transaction.onabort = () => reject(transaction.error || new Error('保存文件夹授权被中止'));
+      });
+    } finally {
+      database.close();
+    }
+  }
+
+  async function deleteStoredDirectoryHandle() {
+    const database = await openDirectoryDatabase();
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = database.transaction(DIRECTORY_STORE_NAME, 'readwrite');
+        transaction.objectStore(DIRECTORY_STORE_NAME).delete(DIRECTORY_HANDLE_KEY);
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error || new Error('无法清除文件夹授权'));
+        transaction.onabort = () => reject(transaction.error || new Error('清除文件夹授权被中止'));
+      });
+    } finally {
+      database.close();
+    }
+  }
+
+  async function queryDirectoryPermission(handle) {
+    if (!handle) return 'none';
+    if (typeof handle.queryPermission !== 'function') return 'prompt';
+    try {
+      return await handle.queryPermission({ mode: 'readwrite' });
+    } catch {
+      return 'prompt';
+    }
+  }
+
+  async function restoreDirectoryHandle() {
+    if (!supportsDirectoryPicker()) {
+      runtime.directoryHandle = null;
+      runtime.directoryPermission = 'unsupported';
+      refreshDirectoryUi();
+      return;
+    }
+
+    try {
+      const handle = await readStoredDirectoryHandle();
+      runtime.directoryHandle = handle;
+      runtime.directoryPermission = handle ? await queryDirectoryPermission(handle) : 'none';
+    } catch (error) {
+      runtime.directoryHandle = null;
+      runtime.directoryPermission = 'none';
+      log(`恢复保存文件夹失败：${error.message}`, 'warn');
+    }
+    refreshDirectoryUi();
+  }
+
+  async function requestStoredDirectoryPermission() {
+    const handle = runtime.directoryHandle;
+    if (!handle) return 'none';
+
+    let permission = 'prompt';
+    if (typeof handle.requestPermission === 'function') {
+      try {
+        permission = await handle.requestPermission({ mode: 'readwrite' });
+      } catch {
+        permission = 'denied';
+      }
+    } else {
+      permission = await queryDirectoryPermission(handle);
+    }
+
+    runtime.directoryPermission = permission;
+    refreshDirectoryUi();
+    return permission;
+  }
+
+  async function chooseDownloadDirectory() {
+    if (!supportsDirectoryPicker()) {
+      throw new Error('当前浏览器不支持直接选择保存文件夹，请使用最新版 Chrome');
+    }
+
+    if (runtime.directoryHandle) {
+      const permission = await requestStoredDirectoryPermission();
+      if (permission === 'granted') {
+        log(`已重新获得文件夹写入权限：${runtime.directoryHandle.name}`, 'success');
+        return runtime.directoryHandle;
+      }
+    }
+
+    const handle = await window.showDirectoryPicker({
+      id: 'ao3txt-download-folder',
+      mode: 'readwrite',
+      startIn: 'downloads',
+    });
+
+    runtime.directoryHandle = handle;
+    runtime.directoryPermission = await queryDirectoryPermission(handle);
+    await storeDirectoryHandle(handle);
+
+    if (ui.useSelectedDirectory) {
+      ui.useSelectedDirectory.checked = true;
+      saveSettings(readSettingsFromUi());
+    }
+
+    refreshDirectoryUi();
+    log(`已选择保存文件夹：${handle.name}`, 'success');
+    return handle;
+  }
+
+  async function clearDownloadDirectory() {
+    runtime.directoryHandle = null;
+    runtime.directoryPermission = 'none';
+    try {
+      await deleteStoredDirectoryHandle();
+    } catch (error) {
+      log(`清除已保存文件夹时出现问题：${error.message}`, 'warn');
+    }
+
+    if (ui.useSelectedDirectory) {
+      ui.useSelectedDirectory.checked = false;
+      saveSettings(readSettingsFromUi());
+    }
+
+    refreshDirectoryUi();
+    log('已取消保存文件夹选择，之后将使用浏览器默认下载目录。', 'warn');
+  }
+
+  async function prepareSelectedDirectory(settings) {
+    if (!settings.useSelectedDirectory) return null;
+    if (!supportsDirectoryPicker()) {
+      throw new Error('当前浏览器不支持直接写入所选文件夹，请取消“保存到所选文件夹”');
+    }
+    if (!runtime.directoryHandle) {
+      throw new Error('请先点击“选择保存文件夹”');
+    }
+
+    const permission = await requestStoredDirectoryPermission();
+    if (permission !== 'granted') {
+      throw new Error('没有所选文件夹的写入权限，请重新选择文件夹');
+    }
+    return runtime.directoryHandle;
+  }
+
+  async function entryExists(directoryHandle, filename) {
+    try {
+      await directoryHandle.getFileHandle(filename);
+      return true;
+    } catch (error) {
+      if (error?.name === 'NotFoundError') return false;
+      if (error?.name === 'TypeMismatchError') return true;
+      throw error;
+    }
+  }
+
+  async function uniqueFilenameInDirectory(directoryHandle, filename) {
+    const safeName = sanitizeFilename(filename);
+    if (!(await entryExists(directoryHandle, safeName))) return safeName;
+
+    const dotIndex = safeName.lastIndexOf('.');
+    const hasExtension = dotIndex > 0;
+    const base = hasExtension ? safeName.slice(0, dotIndex) : safeName;
+    const extension = hasExtension ? safeName.slice(dotIndex) : '';
+
+    for (let index = 1; index <= 9999; index += 1) {
+      const candidate = `${base} (${index})${extension}`;
+      if (!(await entryExists(directoryHandle, candidate))) return candidate;
+    }
+
+    throw new Error(`文件名冲突过多：${safeName}`);
+  }
+
+  async function writeBlobToSelectedDirectory(blob, filename) {
+    const directoryHandle = runtime.directoryHandle;
+    if (!directoryHandle) throw new Error('没有可用的保存文件夹');
+
+    const actualFilename = await uniqueFilenameInDirectory(directoryHandle, filename);
+    const fileHandle = await directoryHandle.getFileHandle(actualFilename, { create: true });
+    const writable = await fileHandle.createWritable();
+
+    try {
+      await writable.write(blob);
+      await writable.close();
+    } catch (error) {
+      try { await writable.abort(); } catch { /* 忽略关闭错误 */ }
+      throw error;
+    }
+
+    return actualFilename;
+  }
+
+  function directoryStatusText() {
+    if (!supportsDirectoryPicker()) return '当前浏览器不支持直接选择文件夹，将使用浏览器默认下载目录。';
+    if (!runtime.directoryHandle) return '尚未选择文件夹，将使用浏览器默认下载目录。';
+
+    const name = runtime.directoryHandle.name || '已选择的文件夹';
+    if (runtime.directoryPermission === 'granted') return `当前文件夹：${name}（已授权）`;
+    if (runtime.directoryPermission === 'denied') return `当前文件夹：${name}（权限被拒绝，请重新选择）`;
+    return `当前文件夹：${name}（开始下载时可能需要重新授权）`;
+  }
+
+  function refreshDirectoryUi() {
+    if (!ui.directoryStatus) return;
+    ui.directoryStatus.textContent = directoryStatusText();
+
+    const supported = supportsDirectoryPicker();
+    const hasHandle = Boolean(runtime.directoryHandle);
+    if (ui.selectDirectoryButton) {
+      ui.selectDirectoryButton.disabled = runtime.running || !supported;
+      ui.selectDirectoryButton.textContent = hasHandle ? '重新授权或更换文件夹' : '选择保存文件夹';
+    }
+    if (ui.clearDirectoryButton) {
+      ui.clearDirectoryButton.disabled = runtime.running || !hasHandle;
+    }
+    if (ui.useSelectedDirectory) {
+      ui.useSelectedDirectory.disabled = runtime.running || !supported || !hasHandle;
+    }
   }
 
   function restoreQueue() {
@@ -253,6 +525,30 @@
     return 300;
   }
 
+  function normalizeDelayRange(minValue, maxValue, fallbackMin, fallbackMax) {
+    let min = Number(minValue);
+    let max = Number(maxValue);
+    if (!Number.isFinite(min)) min = fallbackMin;
+    if (!Number.isFinite(max)) max = fallbackMax;
+    min = Math.max(0, Math.floor(min));
+    max = Math.max(0, Math.floor(max));
+    return min <= max ? [min, max] : [max, min];
+  }
+
+  function randomDelaySeconds(minValue, maxValue) {
+    const [min, max] = normalizeDelayRange(minValue, maxValue, 0, 0);
+    if (min === max) return min;
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  async function waitRandomDelay(label, minValue, maxValue) {
+    const seconds = randomDelaySeconds(minValue, maxValue);
+    if (seconds <= 0) return;
+    log(`${label}：随机等待 ${seconds} 秒。`);
+    setStatus(`${label}，等待 ${seconds} 秒`);
+    await interruptibleSleep(seconds * 1000);
+  }
+
   function parseWorkDocument(html, finalUrl) {
     const documentNode = new DOMParser().parseFromString(html, 'text/html');
 
@@ -317,14 +613,71 @@
       } catch (error) {
         if (attempt >= maxRetries) throw error;
         attempt += 1;
-        const delaySeconds = Math.min(30, 2 ** attempt);
-        log(`读取失败，${delaySeconds} 秒后重试 ${attempt}/${maxRetries}：${error.message}`, 'warn');
+        const delaySeconds = randomDelaySeconds(settings.retryDelayMinSeconds, settings.retryDelayMaxSeconds);
+        log(`读取失败，随机等待 ${delaySeconds} 秒后重试 ${attempt}/${maxRetries}：${error.message}`, 'warn');
+        setStatus(`读取失败，${delaySeconds} 秒后重试`);
         await interruptibleSleep(delaySeconds * 1000);
       }
     }
   }
 
-  function gmDownloadFile(url, filename) {
+  function downloadBlobWithBrowser(blob, filename) {
+    const blobUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = blobUrl;
+    anchor.download = filename;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+  }
+
+  function gmRequestBlob(url, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const request = GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        timeout: timeoutMs,
+        anonymous: false,
+        responseType: 'blob',
+        onload: (response) => {
+          runtime.activeDownloads.delete(request);
+          if (response.status < 200 || response.status >= 400) {
+            reject(new Error(`读取下载文件失败（HTTP ${response.status}）`));
+            return;
+          }
+          if (!(response.response instanceof Blob) || response.response.size === 0) {
+            reject(new Error('读取到的下载文件为空'));
+            return;
+          }
+          resolve(response.response);
+        },
+        onerror: (error) => {
+          runtime.activeDownloads.delete(request);
+          reject(new Error(error?.error || '读取下载文件失败'));
+        },
+        ontimeout: () => {
+          runtime.activeDownloads.delete(request);
+          reject(new Error('读取下载文件超时'));
+        },
+      });
+      if (request) runtime.activeDownloads.add(request);
+    });
+  }
+
+  async function downloadThroughBlob(url, filename, timeoutMs) {
+    const blob = await gmRequestBlob(url, timeoutMs);
+    downloadBlobWithBrowser(blob, filename);
+  }
+
+  async function downloadToSelectedDirectory(url, filename, timeoutMs) {
+    const blob = await gmRequestBlob(url, timeoutMs);
+    const actualFilename = await writeBlobToSelectedDirectory(blob, filename);
+    return { method: 'selected-directory', filename: actualFilename };
+  }
+
+  function gmDownloadFile(url, filename, timeoutMs) {
     return new Promise((resolve, reject) => {
       let handle;
       try {
@@ -335,12 +688,24 @@
           conflictAction: 'uniquify',
           onload: () => {
             runtime.activeDownloads.delete(handle);
-            resolve();
+            resolve({ method: 'GM_download' });
           },
-          onerror: (error) => {
+          onerror: async (error) => {
             runtime.activeDownloads.delete(handle);
             const reason = error?.error || 'not_succeeded';
             const details = error?.details ? `：${error.details}` : '';
+
+            if (reason === 'not_whitelisted') {
+              try {
+                log(`${filename}：扩展名被 Tampermonkey 拦截，改用浏览器文件方式下载。`, 'warn');
+                await downloadThroughBlob(url, filename, timeoutMs);
+                resolve({ method: 'blob-fallback' });
+              } catch (fallbackError) {
+                reject(new Error(`Tampermonkey 拒绝该扩展名，备用下载也失败：${fallbackError.message}`));
+              }
+              return;
+            }
+
             reject(new Error(`下载失败 ${reason}${details}`));
           },
           ontimeout: () => {
@@ -360,6 +725,31 @@
       try { handle?.abort?.(); } catch { /* 忽略 */ }
     }
     runtime.activeDownloads.clear();
+  }
+
+  async function downloadFileWithRetry(url, filename, settings) {
+    const maxRetries = Math.max(0, Number(settings.maxRetries) || 0);
+    const timeoutMs = Math.max(10, Number(settings.requestTimeoutSeconds) || 60) * 1000;
+    let attempt = 0;
+
+    while (true) {
+      await waitWhilePaused();
+      if (runtime.stopped) throw new Error('任务已停止');
+
+      try {
+        if (settings.useSelectedDirectory) {
+          return await downloadToSelectedDirectory(url, filename, timeoutMs);
+        }
+        return await gmDownloadFile(url, filename, timeoutMs);
+      } catch (error) {
+        if (attempt >= maxRetries) throw error;
+        attempt += 1;
+        const delaySeconds = randomDelaySeconds(settings.retryDelayMinSeconds, settings.retryDelayMaxSeconds);
+        log(`${filename}：下载失败，随机等待 ${delaySeconds} 秒后重试 ${attempt}/${maxRetries}：${error.message}`, 'warn');
+        setStatus(`下载失败，${delaySeconds} 秒后重试`);
+        await interruptibleSleep(delaySeconds * 1000);
+      }
+    }
   }
 
   function formatSucceeded(records, workId, format) {
@@ -386,6 +776,7 @@
     if (!runtime.works.length) throw new Error('请先导入 TXT 文件');
     if (!formats.length) throw new Error('至少选择 EPUB 或 PDF 一种格式');
 
+    await prepareSelectedDirectory(settings);
     saveSettings(settings);
     runtime.running = true;
     runtime.paused = false;
@@ -434,7 +825,7 @@
           runtime.currentIndex = index + 1;
           refreshUi();
           if (index < runtime.works.length - 1) {
-            await interruptibleSleep(Math.max(0, settings.workDelaySeconds) * 1000);
+            await waitRandomDelay('下一部作品前', settings.workDelayMinSeconds, settings.workDelayMaxSeconds);
           }
           continue;
         }
@@ -460,10 +851,21 @@
           log(`开始下载：${filename}`);
 
           try {
-            await gmDownloadFile(downloadUrl, filename);
+            const result = await downloadFileWithRetry(downloadUrl, filename, settings);
+            const actualFilename = result?.filename || filename;
             runtime.stats.success += 1;
-            updateRecord(records, work, workData.title, format, 'success', { filename, downloadUrl });
-            log(`完成：${filename}`, 'success');
+            updateRecord(records, work, workData.title, format, 'success', {
+              filename: actualFilename,
+              downloadUrl,
+              downloadMethod: result?.method || 'unknown',
+              directoryName: result?.method === 'selected-directory' ? runtime.directoryHandle?.name || '' : '',
+            });
+            const methodNote = result?.method === 'blob-fallback'
+              ? '（备用下载）'
+              : result?.method === 'selected-directory'
+                ? `（已保存到 ${runtime.directoryHandle?.name || '所选文件夹'}）`
+                : '';
+            log(`完成：${actualFilename}${methodNote}`, 'success');
           } catch (error) {
             runtime.stats.failed += 1;
             updateRecord(records, work, workData.title, format, 'failed', {
@@ -476,7 +878,7 @@
 
           refreshUi();
           if (formatIndex < pendingFormats.length - 1) {
-            await interruptibleSleep(Math.max(0, settings.formatDelaySeconds) * 1000);
+            await waitRandomDelay('下一种格式前', settings.formatDelayMinSeconds, settings.formatDelayMaxSeconds);
           }
         }
 
@@ -485,7 +887,7 @@
         if (runtime.stopped) break;
 
         if (index < runtime.works.length - 1) {
-          await interruptibleSleep(Math.max(0, settings.workDelaySeconds) * 1000);
+          await waitRandomDelay('下一部作品前', settings.workDelayMinSeconds, settings.workDelayMaxSeconds);
         }
       }
 
@@ -596,13 +998,36 @@
     const formats = [];
     if (ui.epub.checked) formats.push('EPUB');
     if (ui.pdf.checked) formats.push('PDF');
+    const [workDelayMinSeconds, workDelayMaxSeconds] = normalizeDelayRange(
+      ui.workDelayMin.value,
+      ui.workDelayMax.value,
+      DEFAULT_SETTINGS.workDelayMinSeconds,
+      DEFAULT_SETTINGS.workDelayMaxSeconds,
+    );
+    const [formatDelayMinSeconds, formatDelayMaxSeconds] = normalizeDelayRange(
+      ui.formatDelayMin.value,
+      ui.formatDelayMax.value,
+      DEFAULT_SETTINGS.formatDelayMinSeconds,
+      DEFAULT_SETTINGS.formatDelayMaxSeconds,
+    );
+    const [retryDelayMinSeconds, retryDelayMaxSeconds] = normalizeDelayRange(
+      ui.retryDelayMin.value,
+      ui.retryDelayMax.value,
+      DEFAULT_SETTINGS.retryDelayMinSeconds,
+      DEFAULT_SETTINGS.retryDelayMaxSeconds,
+    );
     return {
       formats,
       skipDownloaded: ui.skipDownloaded.checked,
-      workDelaySeconds: Math.max(0, Number(ui.workDelay.value) || 0),
-      formatDelaySeconds: Math.max(0, Number(ui.formatDelay.value) || 0),
+      workDelayMinSeconds,
+      workDelayMaxSeconds,
+      formatDelayMinSeconds,
+      formatDelayMaxSeconds,
+      retryDelayMinSeconds,
+      retryDelayMaxSeconds,
       maxRetries: Math.max(0, Math.min(10, Number(ui.maxRetries.value) || 0)),
       requestTimeoutSeconds: Math.max(10, Number(ui.requestTimeout.value) || 60),
+      useSelectedDirectory: Boolean(ui.useSelectedDirectory?.checked),
     };
   }
 
@@ -610,10 +1035,15 @@
     ui.epub.checked = settings.formats.includes('EPUB');
     ui.pdf.checked = settings.formats.includes('PDF');
     ui.skipDownloaded.checked = Boolean(settings.skipDownloaded);
-    ui.workDelay.value = settings.workDelaySeconds;
-    ui.formatDelay.value = settings.formatDelaySeconds;
+    ui.workDelayMin.value = settings.workDelayMinSeconds;
+    ui.workDelayMax.value = settings.workDelayMaxSeconds;
+    ui.formatDelayMin.value = settings.formatDelayMinSeconds;
+    ui.formatDelayMax.value = settings.formatDelayMaxSeconds;
+    ui.retryDelayMin.value = settings.retryDelayMinSeconds;
+    ui.retryDelayMax.value = settings.retryDelayMaxSeconds;
     ui.maxRetries.value = settings.maxRetries;
     ui.requestTimeout.value = settings.requestTimeoutSeconds;
+    ui.useSelectedDirectory.checked = Boolean(settings.useSelectedDirectory);
   }
 
   function setStatus(text) {
@@ -654,20 +1084,22 @@
     ui.clearQueueButton.disabled = runtime.running || !runtime.works.length;
     ui.exportNormalizedButton.disabled = !runtime.works.length;
     ui.exportInvalidButton.disabled = !runtime.invalidLines.length;
+    refreshDirectoryUi();
   }
 
   function createUi() {
     GM_addStyle(`
       #ao3txt-launcher { position: fixed; right: 18px; bottom: 22px; z-index: 99998; border: 0; border-radius: 999px; padding: 10px 15px; background: #7b1e2b; color: #fff; font: 14px/1.2 system-ui, sans-serif; cursor: pointer; box-shadow: 0 3px 14px rgba(0,0,0,.28); }
-      #ao3txt-panel { position: fixed; right: 18px; bottom: 70px; z-index: 99999; width: min(460px, calc(100vw - 28px)); max-height: calc(100vh - 90px); overflow: auto; box-sizing: border-box; border: 1px solid #bbb; border-radius: 10px; padding: 14px; background: #fff; color: #222; font: 13px/1.45 system-ui, sans-serif; box-shadow: 0 8px 32px rgba(0,0,0,.3); display: none; }
+      #ao3txt-panel { position: fixed; right: 18px; bottom: 70px; z-index: 99999; width: min(760px, calc(100vw - 36px)); min-width: min(560px, calc(100vw - 36px)); max-height: calc(100vh - 90px); overflow: auto; box-sizing: border-box; border: 1px solid #bbb; border-radius: 12px; padding: 18px; background: #fff; color: #222; font: 14px/1.55 system-ui, sans-serif; box-shadow: 0 8px 32px rgba(0,0,0,.3); display: none; resize: both; }
       #ao3txt-panel * { box-sizing: border-box; }
-      #ao3txt-panel h2 { margin: 0; font-size: 17px; }
-      #ao3txt-panel h3 { margin: 13px 0 7px; font-size: 14px; }
-      #ao3txt-panel button { border: 1px solid #999; border-radius: 5px; padding: 6px 9px; background: #f6f6f6; color: #222; cursor: pointer; }
+      #ao3txt-panel h2 { margin: 0; font-size: 19px; }
+      #ao3txt-panel h3 { margin: 16px 0 8px; font-size: 15px; }
+      #ao3txt-panel button { border: 1px solid #999; border-radius: 5px; padding: 7px 11px; background: #f6f6f6; color: #222; cursor: pointer; white-space: nowrap; }
       #ao3txt-panel button.primary { background: #7b1e2b; border-color: #7b1e2b; color: #fff; }
       #ao3txt-panel button:disabled { opacity: .45; cursor: not-allowed; }
-      #ao3txt-panel input[type="number"] { width: 68px; padding: 4px; }
-      .ao3txt-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 7px 0; }
+      #ao3txt-panel input[type="number"] { width: 82px; padding: 5px 7px; }
+      .ao3txt-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+      .ao3txt-row > label { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
       .ao3txt-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
       .ao3txt-muted { color: #666; font-size: 12px; overflow-wrap: anywhere; }
       .ao3txt-box { border: 1px solid #ddd; border-radius: 7px; padding: 9px; background: #fafafa; }
@@ -675,12 +1107,17 @@
       .ao3txt-stat { border: 1px solid #ddd; border-radius: 6px; padding: 5px; background: #fff; }
       .ao3txt-progress-track { height: 8px; background: #e4e4e4; border-radius: 999px; overflow: hidden; }
       #ao3txt-progress-bar { height: 100%; width: 0; background: #7b1e2b; transition: width .2s; }
-      #ao3txt-log { max-height: 190px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #ddd; border-radius: 6px; padding: 7px; background: #111; color: #ddd; font: 12px/1.45 ui-monospace, monospace; }
+      #ao3txt-log { min-height: 180px; max-height: 300px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid #ddd; border-radius: 6px; padding: 9px; background: #111; color: #ddd; font: 12px/1.5 ui-monospace, monospace; }
       .ao3txt-log-success { color: #8ee28e; }
       .ao3txt-log-warn { color: #ffd66b; }
       .ao3txt-log-error { color: #ff8f8f; }
       #ao3txt-drop { border: 2px dashed #aaa; border-radius: 7px; padding: 14px; text-align: center; cursor: pointer; background: #fff; }
       #ao3txt-drop.drag { border-color: #7b1e2b; background: #fff2f4; }
+      @media (max-width: 620px) {
+        #ao3txt-panel { right: 8px; bottom: 62px; width: calc(100vw - 16px); min-width: 0; max-height: calc(100vh - 74px); padding: 13px; resize: none; }
+        #ao3txt-panel h2 { font-size: 17px; }
+        .ao3txt-stats { grid-template-columns: repeat(2, 1fr); }
+      }
       @media (prefers-color-scheme: dark) {
         #ao3txt-panel { background: #222; color: #eee; border-color: #555; }
         #ao3txt-panel button { background: #333; color: #eee; border-color: #666; }
@@ -721,13 +1158,25 @@
           <label><input id="ao3txt-skip" type="checkbox"> 跳过已成功下载</label>
         </div>
         <div class="ao3txt-row">
-          <label>作品间隔 <input id="ao3txt-work-delay" type="number" min="0" step="1"> 秒</label>
-          <label>格式间隔 <input id="ao3txt-format-delay" type="number" min="0" step="1"> 秒</label>
+          <button type="button" data-action="select-directory">选择保存文件夹</button>
+          <button type="button" data-action="clear-directory">取消文件夹选择</button>
+          <label><input id="ao3txt-use-directory" type="checkbox"> 保存到所选文件夹</label>
+        </div>
+        <div id="ao3txt-directory-status" class="ao3txt-muted">正在读取文件夹设置……</div>
+        <div class="ao3txt-row">
+          <label>作品间隔 <input id="ao3txt-work-delay-min" type="number" min="0" step="1"> 至 <input id="ao3txt-work-delay-max" type="number" min="0" step="1"> 秒</label>
         </div>
         <div class="ao3txt-row">
-          <label>失败重试 <input id="ao3txt-retries" type="number" min="0" max="10" step="1"> 次</label>
+          <label>格式间隔 <input id="ao3txt-format-delay-min" type="number" min="0" step="1"> 至 <input id="ao3txt-format-delay-max" type="number" min="0" step="1"> 秒</label>
+        </div>
+        <div class="ao3txt-row">
+          <label>失败重试间隔 <input id="ao3txt-retry-delay-min" type="number" min="0" step="1"> 至 <input id="ao3txt-retry-delay-max" type="number" min="0" step="1"> 秒</label>
+        </div>
+        <div class="ao3txt-row">
+          <label>失败重试次数 <input id="ao3txt-retries" type="number" min="0" max="10" step="1"> 次</label>
           <label>读取超时 <input id="ao3txt-timeout" type="number" min="10" step="10"> 秒</label>
         </div>
+        <div class="ao3txt-muted">每次等待都会在最小值和最大值之间重新随机取一个整数。AO3 返回 429 时，仍按服务器指定时间暂停。选择文件夹后，EPUB 和 PDF 会直接写入该文件夹；同名文件会自动加编号。未启用文件夹模式时，EPUB 被 Tampermonkey 拦截会自动使用备用下载。</div>
       </div>
 
       <h3>3. 开始下载</h3>
@@ -764,8 +1213,16 @@
     ui.epub = panel.querySelector('#ao3txt-epub');
     ui.pdf = panel.querySelector('#ao3txt-pdf');
     ui.skipDownloaded = panel.querySelector('#ao3txt-skip');
-    ui.workDelay = panel.querySelector('#ao3txt-work-delay');
-    ui.formatDelay = panel.querySelector('#ao3txt-format-delay');
+    ui.useSelectedDirectory = panel.querySelector('#ao3txt-use-directory');
+    ui.directoryStatus = panel.querySelector('#ao3txt-directory-status');
+    ui.selectDirectoryButton = panel.querySelector('[data-action="select-directory"]');
+    ui.clearDirectoryButton = panel.querySelector('[data-action="clear-directory"]');
+    ui.workDelayMin = panel.querySelector('#ao3txt-work-delay-min');
+    ui.workDelayMax = panel.querySelector('#ao3txt-work-delay-max');
+    ui.formatDelayMin = panel.querySelector('#ao3txt-format-delay-min');
+    ui.formatDelayMax = panel.querySelector('#ao3txt-format-delay-max');
+    ui.retryDelayMin = panel.querySelector('#ao3txt-retry-delay-min');
+    ui.retryDelayMax = panel.querySelector('#ao3txt-retry-delay-max');
     ui.maxRetries = panel.querySelector('#ao3txt-retries');
     ui.requestTimeout = panel.querySelector('#ao3txt-timeout');
     ui.progressBar = panel.querySelector('#ao3txt-progress-bar');
@@ -794,6 +1251,19 @@
     launcher.addEventListener('click', () => togglePanel());
     panel.querySelector('[data-action="close"]').addEventListener('click', () => togglePanel(false));
     ui.importButton.addEventListener('click', () => ui.file.click());
+    ui.selectDirectoryButton.addEventListener('click', () => {
+      chooseDownloadDirectory().catch((error) => {
+        if (error?.name !== 'AbortError') {
+          alert(error.message || '选择保存文件夹失败');
+          log(`选择保存文件夹失败：${error.message || error}`, 'error');
+        }
+      });
+    });
+    ui.clearDirectoryButton.addEventListener('click', () => {
+      clearDownloadDirectory().catch((error) => {
+        alert(error.message || '取消文件夹选择失败');
+      });
+    });
     ui.drop.addEventListener('click', () => ui.file.click());
     ui.file.addEventListener('change', () => handleFile(ui.file.files?.[0]).catch((error) => alert(error.message)));
 
@@ -869,11 +1339,24 @@
       refreshUi();
     });
 
-    [ui.epub, ui.pdf, ui.skipDownloaded, ui.workDelay, ui.formatDelay, ui.maxRetries, ui.requestTimeout]
-      .forEach((element) => element.addEventListener('change', () => saveSettings(readSettingsFromUi())));
+    [
+      ui.epub,
+      ui.pdf,
+      ui.skipDownloaded,
+      ui.useSelectedDirectory,
+      ui.workDelayMin,
+      ui.workDelayMax,
+      ui.formatDelayMin,
+      ui.formatDelayMax,
+      ui.retryDelayMin,
+      ui.retryDelayMax,
+      ui.maxRetries,
+      ui.requestTimeout,
+    ].forEach((element) => element.addEventListener('change', () => saveSettings(readSettingsFromUi())));
 
     GM_registerMenuCommand(`${APP_NAME}：打开面板`, () => togglePanel(true));
     refreshUi();
+    restoreDirectoryHandle();
     if (runtime.works.length) setStatus(`已恢复上次导入的 ${runtime.works.length} 部作品`);
   }
 
